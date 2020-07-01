@@ -8,7 +8,9 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -30,7 +32,7 @@ func init() {
 	logging.SetLogLevel("*", "DEBUG") //nolint: errcheck
 }
 
-var sealProofType = abi.RegisteredProof_StackedDRG2KiBSeal
+var sealProofType = abi.RegisteredSealProof_StackedDrg2KiBV1
 var sectorSize, _ = sealProofType.SectorSize()
 
 var sealRand = abi.SealRandomness{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 1, 2}
@@ -43,7 +45,10 @@ type seal struct {
 }
 
 func data(sn abi.SectorNumber, dlen abi.UnpaddedPieceSize) io.Reader {
-	return io.LimitReader(rand.New(rand.NewSource(42+int64(sn))), int64(dlen))
+	return io.MultiReader(
+		io.LimitReader(rand.New(rand.NewSource(42+int64(sn))), int64(123)),
+		io.LimitReader(rand.New(rand.NewSource(42+int64(sn))), int64(dlen-123)),
+	)
 }
 
 func (s *seal) precommit(t *testing.T, sb *Sealer, id abi.SectorID, done func()) {
@@ -86,7 +91,7 @@ func (s *seal) commit(t *testing.T, sb *Sealer, done func()) {
 	ok, err := ProofVerifier.VerifySeal(abi.SealVerifyInfo{
 		SectorID:              s.id,
 		SealedCID:             s.cids.Sealed,
-		RegisteredProof:       sealProofType,
+		SealProof:             sealProofType,
 		Proof:                 proof,
 		Randomness:            s.ticket,
 		InteractiveRandomness: seed,
@@ -229,10 +234,14 @@ func getGrothParamFileAndVerifyingKeys(s abi.SectorSize) {
 // go test -run=^TestDownloadParams
 //
 func TestDownloadParams(t *testing.T) {
+	defer requireFDsClosed(t, openFDs(t))
+
 	getGrothParamFileAndVerifyingKeys(sectorSize)
 }
 
 func TestSealAndVerify(t *testing.T) {
+	defer requireFDsClosed(t, openFDs(t))
+
 	if runtime.NumCPU() < 10 && os.Getenv("CI") == "" { // don't bother on slow hardware
 		t.Skip("this is slow")
 	}
@@ -288,7 +297,7 @@ func TestSealAndVerify(t *testing.T) {
 
 	post(t, sb, s)
 
-	if err := sb.FinalizeSector(context.TODO(), si); err != nil {
+	if err := sb.FinalizeSector(context.TODO(), si, nil); err != nil {
 		t.Fatalf("%+v", err)
 	}
 
@@ -301,6 +310,8 @@ func TestSealAndVerify(t *testing.T) {
 }
 
 func TestSealPoStNoCommit(t *testing.T) {
+	defer requireFDsClosed(t, openFDs(t))
+
 	if runtime.NumCPU() < 10 && os.Getenv("CI") == "" { // don't bother on slow hardware
 		t.Skip("this is slow")
 	}
@@ -347,7 +358,7 @@ func TestSealPoStNoCommit(t *testing.T) {
 
 	precommit := time.Now()
 
-	if err := sb.FinalizeSector(context.TODO(), si); err != nil {
+	if err := sb.FinalizeSector(context.TODO(), si, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -361,6 +372,8 @@ func TestSealPoStNoCommit(t *testing.T) {
 }
 
 func TestSealAndVerify2(t *testing.T) {
+	defer requireFDsClosed(t, openFDs(t))
+
 	if runtime.NumCPU() < 10 && os.Getenv("CI") == "" { // don't bother on slow hardware
 		t.Skip("this is slow")
 	}
@@ -426,7 +439,48 @@ func BenchmarkWriteWithAlignment(b *testing.B) {
 		tf, _ := ioutil.TempFile("/tmp/", "scrb-")
 		b.StartTimer()
 
-		ffi.WriteWithAlignment(abi.RegisteredProof_StackedDRG2KiBSeal, rf, bt, tf, nil)
+		ffi.WriteWithAlignment(abi.RegisteredSealProof_StackedDrg2KiBV1, rf, bt, tf, nil)
 		w()
 	}
+}
+
+func openFDs(t *testing.T) int {
+	dent, err := ioutil.ReadDir("/proc/self/fd")
+	require.NoError(t, err)
+
+	var skip int
+	for _, info := range dent {
+		l, err := os.Readlink(filepath.Join("/proc/self/fd", info.Name()))
+		if err != nil {
+			continue
+		}
+
+		if strings.HasPrefix(l, "/dev/nvidia") {
+			skip++
+		}
+	}
+
+	return len(dent) - skip
+}
+
+func requireFDsClosed(t *testing.T, start int) {
+	openNow := openFDs(t)
+
+	if start != openNow {
+		dent, err := ioutil.ReadDir("/proc/self/fd")
+		require.NoError(t, err)
+
+		for _, info := range dent {
+			l, err := os.Readlink(filepath.Join("/proc/self/fd", info.Name()))
+			if err != nil {
+				fmt.Printf("FD err %s\n", err)
+				continue
+			}
+
+			fmt.Printf("FD %s -> %s\n", info.Name(), l)
+		}
+	}
+
+	log.Infow("open FDs", "start", start, "now", openNow)
+	require.Equal(t, start, openNow, "FDs shouldn't leak")
 }

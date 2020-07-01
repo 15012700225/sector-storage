@@ -5,6 +5,7 @@ import (
 	"context"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/go-multierror"
 	"golang.org/x/xerrors"
@@ -15,18 +16,36 @@ import (
 	"github.com/filecoin-project/sector-storage/storiface"
 )
 
+type schedPrioCtxKey int
+
+var SchedPriorityKey schedPrioCtxKey
+var DefaultSchedPriority = 0
+
+func getPriority(ctx context.Context) int {
+	sp := ctx.Value(SchedPriorityKey)
+	if p, ok := sp.(int); ok {
+		return p
+	}
+
+	return DefaultSchedPriority
+}
+
+func WithPriority(ctx context.Context, priority int) context.Context {
+	return context.WithValue(ctx, SchedPriorityKey, priority)
+}
+
 const mib = 1 << 20
 
 type WorkerAction func(ctx context.Context, w Worker) error
 
 type WorkerSelector interface {
-	Ok(ctx context.Context, task sealtasks.TaskType, spt abi.RegisteredProof, a *workerHandle) (bool, error) // true if worker is acceptable for performing a task
+	Ok(ctx context.Context, task sealtasks.TaskType, spt abi.RegisteredSealProof, a *workerHandle) (bool, error) // true if worker is acceptable for performing a task
 
 	Cmp(ctx context.Context, task sealtasks.TaskType, a, b *workerHandle) (bool, error) // true if a is preferred over b
 }
 
 type scheduler struct {
-	spt abi.RegisteredProof
+	spt abi.RegisteredSealProof
 
 	workersLk  sync.Mutex
 	nextWorker WorkerID
@@ -44,7 +63,7 @@ type scheduler struct {
 	schedQueue *requestQueue
 }
 
-func newScheduler(spt abi.RegisteredProof) *scheduler {
+func newScheduler(spt abi.RegisteredSealProof) *scheduler {
 	return &scheduler{
 		spt: spt,
 
@@ -71,6 +90,7 @@ func (sh *scheduler) Schedule(ctx context.Context, sector abi.SectorID, taskType
 	case sh.schedule <- &workerRequest{
 		sector:   sector,
 		taskType: taskType,
+		priority: getPriority(ctx),
 		sel:      sel,
 
 		prepare: prepare,
@@ -98,6 +118,7 @@ func (sh *scheduler) Schedule(ctx context.Context, sector abi.SectorID, taskType
 type workerRequest struct {
 	sector   abi.SectorID
 	taskType sealtasks.TaskType
+	priority int // larger values more important
 	sel      WorkerSelector
 
 	prepare WorkerAction
@@ -204,6 +225,8 @@ func (sh *scheduler) onWorkerFreed(wid WorkerID) {
 	}
 }
 
+var selectorTimeout = 5 * time.Second
+
 func (sh *scheduler) maybeSchedRequest(req *workerRequest) (bool, error) {
 	sh.workersLk.Lock()
 	defer sh.workersLk.Unlock()
@@ -214,7 +237,10 @@ func (sh *scheduler) maybeSchedRequest(req *workerRequest) (bool, error) {
 	needRes := ResourceTable[req.taskType][sh.spt]
 
 	for wid, worker := range sh.workers {
-		ok, err := req.sel.Ok(req.ctx, req.taskType, sh.spt, worker)
+		rpcCtx, cancel := context.WithTimeout(req.ctx, selectorTimeout)
+		ok, err := req.sel.Ok(rpcCtx, req.taskType, sh.spt, worker)
+		cancel()
+
 		if err != nil {
 			return false, err
 		}
@@ -236,7 +262,10 @@ func (sh *scheduler) maybeSchedRequest(req *workerRequest) (bool, error) {
 			var serr error
 
 			sort.SliceStable(acceptable, func(i, j int) bool {
-				r, err := req.sel.Cmp(req.ctx, req.taskType, sh.workers[acceptable[i]], sh.workers[acceptable[j]])
+				rpcCtx, cancel := context.WithTimeout(req.ctx, selectorTimeout)
+				defer cancel()
+				r, err := req.sel.Cmp(rpcCtx, req.taskType, sh.workers[acceptable[i]], sh.workers[acceptable[j]])
+
 				if err != nil {
 					serr = multierror.Append(serr, err)
 				}
@@ -321,7 +350,7 @@ func (sh *scheduler) assignWorker(wid WorkerID, w *workerHandle, req *workerRequ
 	return nil
 }
 
-func (a *activeResources) withResources(spt abi.RegisteredProof, id WorkerID, wr storiface.WorkerResources, r Resources, locker sync.Locker, cb func() error) error {
+func (a *activeResources) withResources(spt abi.RegisteredSealProof, id WorkerID, wr storiface.WorkerResources, r Resources, locker sync.Locker, cb func() error) error {
 	for !canHandleRequest(r, spt, id, wr, a) {
 		if a.cond == nil {
 			a.cond = sync.NewCond(locker)
@@ -367,7 +396,7 @@ func (a *activeResources) free(wr storiface.WorkerResources, r Resources) {
 	a.memUsedMax -= r.MaxMemory
 }
 
-func canHandleRequest(needRes Resources, spt abi.RegisteredProof, wid WorkerID, res storiface.WorkerResources, active *activeResources) bool {
+func canHandleRequest(needRes Resources, spt abi.RegisteredSealProof, wid WorkerID, res storiface.WorkerResources, active *activeResources) bool {
 
 	// TODO: dedupe needRes.BaseMinMemory per task type (don't add if that task is already running)
 	minNeedMem := res.MemReserved + active.memUsedMin + needRes.MinMemory + needRes.BaseMinMemory
@@ -377,10 +406,10 @@ func canHandleRequest(needRes Resources, spt abi.RegisteredProof, wid WorkerID, 
 	}
 
 	maxNeedMem := res.MemReserved + active.memUsedMax + needRes.MaxMemory + needRes.BaseMinMemory
-	if spt == abi.RegisteredProof_StackedDRG32GiBSeal {
+	if spt == abi.RegisteredSealProof_StackedDrg32GiBV1 {
 		maxNeedMem += MaxCachingOverhead
 	}
-	if spt == abi.RegisteredProof_StackedDRG64GiBSeal {
+	if spt == abi.RegisteredSealProof_StackedDrg64GiBV1 {
 		maxNeedMem += MaxCachingOverhead * 2 // ewwrhmwh
 	}
 	if maxNeedMem > res.MemSwap+res.MemPhysical {

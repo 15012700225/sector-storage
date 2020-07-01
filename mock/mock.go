@@ -27,7 +27,7 @@ type SectorMgr struct {
 	pieces       map[cid.Cid][]byte
 	sectorSize   abi.SectorSize
 	nextSectorID abi.SectorNumber
-	proofType    abi.RegisteredProof
+	proofType    abi.RegisteredSealProof
 
 	lk sync.Mutex
 }
@@ -258,22 +258,27 @@ func AddOpFinish(ctx context.Context) (context.Context, func()) {
 }
 
 func (mgr *SectorMgr) GenerateWinningPoSt(ctx context.Context, minerID abi.ActorID, sectorInfo []abi.SectorInfo, randomness abi.PoStRandomness) ([]abi.PoStProof, error) {
-	return generateFakePoSt(sectorInfo), nil
+	return generateFakePoSt(sectorInfo, abi.RegisteredSealProof.RegisteredWinningPoStProof), nil
 }
 
-func (mgr *SectorMgr) GenerateWindowPoSt(ctx context.Context, minerID abi.ActorID, sectorInfo []abi.SectorInfo, randomness abi.PoStRandomness) ([]abi.PoStProof, error) {
-	return generateFakePoSt(sectorInfo), nil
+func (mgr *SectorMgr) GenerateWindowPoSt(ctx context.Context, minerID abi.ActorID, sectorInfo []abi.SectorInfo, randomness abi.PoStRandomness) ([]abi.PoStProof, []abi.SectorID, error) {
+	return generateFakePoSt(sectorInfo, abi.RegisteredSealProof.RegisteredWindowPoStProof), nil, nil
 }
 
-func generateFakePoSt(sectorInfo []abi.SectorInfo) []abi.PoStProof {
-	se, err := sectorInfo[0].RegisteredProof.WindowPoStPartitionSectors()
+func generateFakePoSt(sectorInfo []abi.SectorInfo, rpt func(abi.RegisteredSealProof) (abi.RegisteredPoStProof, error)) []abi.PoStProof {
+	se, err := sectorInfo[0].SealProof.WindowPoStPartitionSectors()
 	if err != nil {
 		panic(err)
 	}
+	wp, err := rpt(sectorInfo[0].SealProof)
+	if err != nil {
+		panic(err)
+	}
+
 	return []abi.PoStProof{
 		{
-			RegisteredProof: sectorInfo[0].RegisteredProof,
-			ProofBytes:      make([]byte, 192*int(math.Ceil(float64(len(sectorInfo))/float64(se)))),
+			PoStProof:  wp,
+			ProofBytes: make([]byte, 192*int(math.Ceil(float64(len(sectorInfo))/float64(se)))),
 		},
 	}
 }
@@ -310,11 +315,27 @@ func (mgr *SectorMgr) StageFakeData(mid abi.ActorID) (abi.SectorID, []abi.PieceI
 	return id, []abi.PieceInfo{pi}, nil
 }
 
-func (mgr *SectorMgr) FinalizeSector(context.Context, abi.SectorID) error {
+func (mgr *SectorMgr) FinalizeSector(context.Context, abi.SectorID, []storage.Range) error {
 	return nil
 }
 
-func (mgr *SectorMgr) CheckProvable(context.Context, abi.RegisteredProof, []abi.SectorID) ([]abi.SectorID, error) {
+func (mgr *SectorMgr) ReleaseUnsealed(ctx context.Context, sector abi.SectorID, safeToFree []storage.Range) error {
+	panic("implement me")
+}
+
+func (mgr *SectorMgr) Remove(ctx context.Context, sector abi.SectorID) error {
+	mgr.lk.Lock()
+	defer mgr.lk.Unlock()
+
+	if _, has := mgr.sectors[sector]; !has {
+		return xerrors.Errorf("sector not found")
+	}
+
+	delete(mgr.sectors, sector)
+	return nil
+}
+
+func (mgr *SectorMgr) CheckProvable(context.Context, abi.RegisteredSealProof, []abi.SectorID) ([]abi.SectorID, error) {
 	return nil, nil
 }
 
@@ -340,14 +361,15 @@ func (m mockVerif) VerifyWindowPoSt(ctx context.Context, info abi.WindowPoStVeri
 	return true, nil
 }
 
-func (m mockVerif) GenerateDataCommitment(pt abi.RegisteredProof, pieces []abi.PieceInfo) (cid.Cid, error) {
+func (m mockVerif) GenerateDataCommitment(pt abi.RegisteredSealProof, pieces []abi.PieceInfo) (cid.Cid, error) {
 	return ffiwrapper.GenerateUnsealedCID(pt, pieces)
 }
 
-func (m mockVerif) GenerateWinningPoStSectorChallenge(ctx context.Context, proofType abi.RegisteredProof, minerID abi.ActorID, randomness abi.PoStRandomness, eligibleSectorCount uint64) ([]uint64, error) {
+func (m mockVerif) GenerateWinningPoStSectorChallenge(ctx context.Context, proofType abi.RegisteredPoStProof, minerID abi.ActorID, randomness abi.PoStRandomness, eligibleSectorCount uint64) ([]uint64, error) {
 	return []uint64{0}, nil
 }
 
 var MockVerifier = mockVerif{}
 
+var _ storage.Sealer = &SectorMgr{}
 var _ ffiwrapper.Verifier = MockVerifier

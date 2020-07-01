@@ -73,7 +73,15 @@ func (t *testWorker) SealCommit2(ctx context.Context, sector abi.SectorID, c1o s
 	panic("implement me")
 }
 
-func (t *testWorker) FinalizeSector(ctx context.Context, sector abi.SectorID) error {
+func (t *testWorker) FinalizeSector(ctx context.Context, sector abi.SectorID, keepUnsealed []storage.Range) error {
+	panic("implement me")
+}
+
+func (t *testWorker) ReleaseUnsealed(ctx context.Context, sector abi.SectorID, safeToFree []storage.Range) error {
+	panic("implement me")
+}
+
+func (t *testWorker) Remove(ctx context.Context, sector abi.SectorID) error {
 	panic("implement me")
 }
 
@@ -94,7 +102,7 @@ func (t *testWorker) Paths(ctx context.Context) ([]stores.StoragePath, error) {
 }
 
 func (t *testWorker) Info(ctx context.Context) (storiface.WorkerInfo, error) {
-	res := ResourceTable[sealtasks.TTPreCommit2][abi.RegisteredProof_StackedDRG2KiBSeal]
+	res := ResourceTable[sealtasks.TTPreCommit2][abi.RegisteredSealProof_StackedDrg2KiBV1]
 
 	return storiface.WorkerInfo{
 		Hostname: "testworkerer",
